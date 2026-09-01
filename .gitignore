@@ -1,0 +1,8 @@
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.py-backup
+Google-Form-Auto-Filler/
+get-pip.py
