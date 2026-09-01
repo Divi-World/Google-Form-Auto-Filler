@@ -1,0 +1,4 @@
+python universal_form_filler.py --url "https://docs.google.com/forms/d/e/YOUR_FORM_ID/viewform" --count 50 --delay 3
+
+
+Change the url to your form link, change the count to your desired count(number of form you want to fill) and change the deay to your desire.

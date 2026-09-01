@@ -1,0 +1,471 @@
+# ============================================================
+# GOOGLE FORM AUTO-FILLER
+# 
+# This script automatically fills and submits a Google Form
+# with realistic student-like responses. It handles multi-page
+# forms, skips "Other" options, and can repeat submissions.
+# ============================================================
+
+import random
+import time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
+
+# ============================================================
+# 1. CONFIGURATION (EDIT THESE AS NEEDED)
+# ============================================================
+
+# Total number of forms to submit
+TOTAL_SUBMISSIONS = 50
+
+# Time (in milliseconds) to wait after each submission before looking
+# for the "Submit another response" link
+WAIT_BEFORE_NEXT = 3000
+
+# Time (in milliseconds) to wait after clicking "Submit another response"
+# before starting the next form
+WAIT_AFTER_NEXT = 4000
+
+# The URL of the Google Form to fill
+# Replace this with your own form link
+FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSdygzPuFnupd7gCrAYa_1jR9-M4eTE4vXf8czr9zgHqs6941Q/viewform"
+
+# ============================================================
+# 2. SETUP DRIVER (uses webdriver-manager for automatic driver handling)
+# ============================================================
+
+service = Service(ChromeDriverManager().install())
+driver = webdriver.Chrome(service=service)
+wait = WebDriverWait(driver, 15)  # maximum wait time for elements (seconds)
+
+def sleep(ms):
+    """Convenience function to sleep for a given number of milliseconds."""
+    time.sleep(ms / 1000.0)
+
+def human_delay():
+    """Add a random delay (0.5–1.5 seconds) to mimic human behavior."""
+    time.sleep(random.uniform(0.5, 1.5))
+
+# ============================================================
+# 3. HELPER FUNCTIONS FOR RADIO BUTTON HANDLING
+# ============================================================
+
+def get_all_radios():
+    """
+    Find all radio button elements on the current page.
+    Works with both standard <input type="radio"> and custom role="radio" elements.
+    """
+    inputs = driver.find_elements(By.XPATH, "//input[@type='radio']")
+    roles = driver.find_elements(By.XPATH, "//*[@role='radio']")
+    all_radios = []
+    seen = set()
+    for r in inputs + roles:
+        if r not in seen:
+            seen.add(r)
+            all_radios.append(r)
+    return all_radios
+
+def get_radio_label(radio):
+    """
+    Extract the human-readable label text for a given radio button.
+    Tries several methods: <label> element, sibling spans, divs, aria-label.
+    """
+    try:
+        label = radio.find_element(By.XPATH, "./ancestor::label")
+        return label.text.strip()
+    except:
+        pass
+    try:
+        parent = radio.find_element(By.XPATH, "..")
+        spans = parent.find_elements(By.XPATH, ".//span[not(@aria-hidden)]")
+        for s in spans:
+            txt = s.text.strip()
+            if txt:
+                return txt
+        divs = parent.find_elements(By.XPATH, ".//div")
+        for d in divs:
+            txt = d.text.strip()
+            if txt and not d.find_elements(By.XPATH, ".//input | .//*[@role='radio']"):
+                return txt
+    except:
+        pass
+    return radio.get_attribute("aria-label") or ""
+
+def is_other_option(label):
+    """
+    Determine if a label corresponds to an 'Other' option (English, Dutch, etc.)
+    These options are skipped to avoid triggering text input fields.
+    """
+    lower = label.lower()
+    return lower in ("other", "anders") or \
+           lower.startswith("other") or lower.startswith("anders") or \
+           "other (please specify)" in lower or "anders:" in lower or "anders -" in lower or \
+           "andere" in lower
+
+def click_radio_by_text(text):
+    """
+    Click a radio button whose label exactly matches the given text
+    (case-insensitive fallback). Returns True if successful.
+    """
+    radios = get_all_radios()
+    for r in radios:
+        if get_radio_label(r) == text:
+            r.click()
+            human_delay()
+            return True
+    for r in radios:
+        if get_radio_label(r).lower() == text.lower():
+            r.click()
+            human_delay()
+            return True
+    return False
+
+def get_radio_groups():
+    """
+    Group radio buttons by question (using the 'name' attribute or the parent container).
+    Returns a dict: {group_key: [list_of_radio_elements]}
+    """
+    groups = {}
+    radios = get_all_radios()
+    for r in radios:
+        # For standard inputs, the name attribute groups them
+        group_key = r.get_attribute("name")
+        if not group_key or "_sentinel" in group_key:
+            # For role="radio", we use the parent question container
+            try:
+                container = r.find_element(By.XPATH, "./ancestor::*[@role='listitem' or contains(@class, 'freebirdFormviewerViewItemsItemItem')]")
+                group_key = container.get_attribute("data-item-id") or container.get_attribute("id") or "group_" + container.text[:20]
+            except:
+                group_key = "ungrouped"
+        if group_key not in groups:
+            groups[group_key] = []
+        groups[group_key].append(r)
+    return groups
+
+def fill_random_radios():
+    """
+    For each radio group on the current page, randomly select one non-'Other' option.
+    Returns a list of strings describing what was selected.
+    """
+    groups = get_radio_groups()
+    selected = []
+    for key, radios in groups.items():
+        # Skip if an option is already checked (avoid double-clicking)
+        already = any(r.get_attribute("aria-checked") == "true" or r.is_selected() for r in radios)
+        if not already:
+            # Filter out 'Other' options
+            valid = [r for r in radios if not is_other_option(get_radio_label(r))]
+            if not valid:
+                print(f"   ⚠️ No non-Other options in group '{key}' – skipping entire group.")
+                continue
+            chosen = random.choice(valid)
+            chosen.click()
+            human_delay()
+            label = get_radio_label(chosen) or "(no label)"
+            selected.append(f"{key} → {label}")
+    return selected
+
+def debug_all_radio_labels():
+    """
+    Print all radio buttons on the current page with their labels and
+    whether they are checked. Useful for debugging.
+    """
+    radios = get_all_radios()
+    if not radios:
+        print("   🔍 No radio elements found on this page.")
+    else:
+        print(f"   🔍 Found {len(radios)} radio elements:")
+        for i, r in enumerate(radios):
+            label = get_radio_label(r) or "(no label)"
+            checked = r.get_attribute("aria-checked") == "true" or r.is_selected()
+            other = " (Other)" if is_other_option(label) else ""
+            print(f"      {i+1}: {label}{other} {checked and '✓' or ''}")
+
+# ============================================================
+# 4. PROFILE GENERATION (realistic student demographics)
+# ============================================================
+
+def generate_profile():
+    """
+    Generate a realistic student profile based on age distribution.
+    The options must exactly match the labels in your Google Form.
+    """
+    # Age brackets (as they appear in the form)
+    age_options = ['15–19 years', '20–24 years', '25–29 years', '30 years and above']
+    faculty_options = [
+        'Communication and Media Studies',
+        'Social Sciences',
+        'Arts',
+        'Management Sciences',
+        'Education',
+        'Engineering',
+        'Sciences',
+        'College of Health Sciences'
+    ]
+
+    # Weighted selection to reflect a typical university population
+    age_weights = [0.45, 0.35, 0.15, 0.05]  # younger students are more common
+    age_label = random.choices(age_options, weights=age_weights)[0]
+
+    # Marital status based on age (human-like)
+    if age_label == '15–19 years':
+        marital = 'Single'
+    elif age_label == '20–24 years':
+        marital = random.choices(['Single', 'Married'], weights=[0.95, 0.05])[0]
+    elif age_label == '25–29 years':
+        marital = random.choices(['Single', 'Married'], weights=[0.4, 0.6])[0]
+    else:  # 30+
+        marital = random.choices(['Married', 'Single', 'Divorced', 'Widowed'], weights=[0.7, 0.15, 0.1, 0.05])[0]
+
+    # Level of study (also age-appropriate)
+    if age_label == '15–19 years':
+        level = random.choices(['100 Level', '200 Level'], weights=[0.6, 0.4])[0]
+    elif age_label == '20–24 years':
+        level = random.choices(['200 Level', '300 Level', '400 Level and above'], weights=[0.4, 0.45, 0.15])[0]
+    elif age_label == '25–29 years':
+        level = random.choices(['300 Level', '400 Level and above'], weights=[0.3, 0.7])[0]
+    else:
+        level = random.choices(['400 Level and above', '300 Level'], weights=[0.8, 0.2])[0]
+
+    gender = random.choice(['Male', 'Female'])
+    faculty = random.choice(faculty_options)
+    return {'gender': gender, 'age': age_label, 'marital': marital, 'level': level, 'faculty': faculty}
+
+# ============================================================
+# 5. NAVIGATION HELPERS (Next / Submit buttons)
+# ============================================================
+
+def click_next_or_submit():
+    """
+    Click the 'Next' or 'Submit' button on the current page.
+    Supports English, Chinese, and Dutch labels.
+    Returns True if it was a 'Next' button (i.e., more pages remain),
+    False if it was 'Submit' (final page) or if the button was not found.
+    """
+    human_delay()
+    # Strategy 1: aria-label
+    try:
+        btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//*[@aria-label='Next' or @aria-label='下一页' or @aria-label='Submit' or @aria-label='提交' or @aria-label='Volgende' or @aria-label='Verzenden' or @aria-label='Indienen']")))
+        if btn.is_enabled():
+            label = btn.get_attribute("aria-label")
+            btn.click()
+            return label not in ('Submit', '提交', 'Verzenden', 'Indienen')
+    except:
+        pass
+    # Strategy 2: role="button" with text
+    try:
+        buttons = driver.find_elements(By.XPATH, "//*[@role='button']")
+        next_texts = ['next', 'volgende', '下一页', 'verder']
+        submit_texts = ['submit', 'verzenden', 'indienen', '提交', 'send', 'verstuur']
+        for b in buttons:
+            text = b.text.strip().lower()
+            if any(n in text for n in next_texts):
+                if b.is_enabled():
+                    b.click()
+                    return True
+            elif any(s in text for s in submit_texts):
+                if b.is_enabled():
+                    b.click()
+                    return False
+    except:
+        pass
+    # Strategy 3: Google Forms specific classes
+    try:
+        next_btn = driver.find_element(By.CSS_SELECTOR, ".freebirdFormviewerViewNavigationNextButton:not(.disabled), [jsname='LgbsSe']")
+        if next_btn.is_enabled():
+            next_btn.click()
+            text = next_btn.text.lower()
+            if any(s in text for s in ['submit', 'verzenden', 'indienen', '提交', 'verstuur']):
+                return False
+            return True
+    except:
+        pass
+    # Strategy 4: any role="button" containing "volgende" or "next"
+    try:
+        btns = driver.find_elements(By.XPATH, "//*[@role='button' and (contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'volgende') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next'))]")
+        if btns:
+            for b in btns:
+                if b.is_enabled():
+                    b.click()
+                    return True
+    except:
+        pass
+    print("⚠️ Could not find Next/Submit button.")
+    return False
+
+def click_submit_another():
+    """
+    Click the 'Submit another response' link after a successful submission.
+    Tries multiple selectors for English, Chinese, and Dutch.
+    Returns True if the link was found and clicked.
+    """
+    # Allow time for the confirmation page to appear
+    sleep(2000)
+    try:
+        wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(),'Nog een') or contains(text(),'Submit another') or contains(text(),'提交另一个')]")))
+    except:
+        pass
+
+    # List of possible selectors (XPath, CSS, or text)
+    strategies = [
+        "//a[text()='Nog een antwoord indienen']",
+        "//a[contains(text(),'Nog een')]",
+        "//*[@role='button' and contains(.,'Nog een')]",
+        "//*[@aria-label and contains(@aria-label,'Nog een')]",
+        "//a[text()='Submit another response']",
+        "//*[@role='button' and contains(.,'Submit another')]",
+        "//*[contains(text(),'提交另一个')]",
+        "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'another response')]",
+        ".freebirdFormviewerViewResponseConfirmationLink",
+    ]
+
+    for selector in strategies:
+        try:
+            if selector.startswith('.'):
+                el = driver.find_element(By.CSS_SELECTOR, selector)
+            elif selector.startswith('//'):
+                el = driver.find_element(By.XPATH, selector)
+            else:
+                el = driver.find_element(By.XPATH, f"//*[contains(text(), '{selector}')]")
+            if el.is_enabled():
+                el.click()
+                human_delay()
+                return True
+        except:
+            continue
+
+    # Last resort: scan all <a> and role="button" elements for text
+    try:
+        all_elems = driver.find_elements(By.XPATH, "//a | //*[@role='button']")
+        for el in all_elems:
+            text = el.text.lower()
+            if 'nog een' in text or 'another response' in text or '提交另一个' in text:
+                if el.is_enabled():
+                    el.click()
+                    human_delay()
+                    return True
+    except:
+        pass
+    return False
+
+# ============================================================
+# 6. FILL ONE COMPLETE FORM
+# ============================================================
+
+def fill_one_form(iteration):
+    """
+    Fill and submit a single Google Form.
+    Returns True if successful, False otherwise.
+    """
+    print(f"\n🔄 Starting submission #{iteration + 1}/{TOTAL_SUBMISSIONS}")
+    profile = generate_profile()
+    print(f"👤 Profile: {profile}")
+
+    # --- Page 1: Demographics ---
+    print("📄 Page 1: Demographics")
+    debug_all_radio_labels()
+
+    fields = [
+        (profile['gender'], 'Gender'),
+        (profile['age'], 'Age Bracket'),
+        (profile['level'], 'Level of Study'),
+        (profile['faculty'], 'Faculty/Colleges'),
+        (profile['marital'], 'Marital Status')
+    ]
+    for label, desc in fields:
+        if click_radio_by_text(label):
+            print(f"   ✓ Selected '{label}' for '{desc}'")
+        else:
+            print(f"   ✗ Could not find '{label}' for '{desc}'")
+
+    # Navigate to page 2
+    print("⏳ Attempting to click 'Next'...")
+    if not click_next_or_submit():
+        print("⚠️ Could not click 'Next' after Page 1 – stopping.")
+        return False
+    print("✅ Clicked 'Next'.")
+    sleep(2000)
+
+    # Wait for the next page to load (presence of radio elements)
+    try:
+        wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='radio'] | //*[@role='radio']")))
+    except:
+        pass
+    sleep(1500)
+
+    # --- Pages 2+ (Likert scales, etc.) ---
+    page_num = 2
+    while True:
+        print(f"📄 Page {page_num}")
+        selections = fill_random_radios()
+        if not selections:
+            print("   No non-Other radio groups found on this page (or no radios). Proceeding...")
+        else:
+            print(f"   Selected {len(selections)} options:")
+            for s in selections:
+                print(f"     - {s}")
+
+        # Try to go to the next page
+        if not click_next_or_submit():
+            print("🏁 Reached final page – form submitted!")
+            break
+        sleep(1500)
+        page_num += 1
+        if page_num > 20:
+            print("⚠️ Max pages reached – stopping.")
+            break
+
+    print(f"✅ Submission #{iteration + 1} completed.")
+    return True
+
+# ============================================================
+# 7. MAIN LOOP (runs the specified number of submissions)
+# ============================================================
+
+try:
+    print(f"🚀 Starting {TOTAL_SUBMISSIONS} submissions...")
+    driver.get(FORM_URL)
+    sleep(3000)  # initial page load
+
+    for i in range(TOTAL_SUBMISSIONS):
+        if i > 0:
+            # After the first submission, we need to click the "Submit another response" link
+            print("⏳ Waiting for 'Submit another response' link...")
+            found = False
+            for attempt in range(30):  # try for up to 30 seconds
+                sleep(1000)
+                if click_submit_another():
+                    found = True
+                    print("✅ Clicked 'Submit another response'.")
+                    break
+            if not found:
+                print("❌ Could not find 'Submit another response' – reloading page.")
+                driver.refresh()
+                sleep(5000)
+            else:
+                sleep(WAIT_AFTER_NEXT)
+
+        # Fill the current form
+        success = fill_one_form(i)
+        if not success:
+            print(f"❌ Submission #{i+1} failed – stopping loop.")
+            break
+
+        # Brief pause before the next iteration
+        if i < TOTAL_SUBMISSIONS - 1:
+            sleep(WAIT_BEFORE_NEXT)
+
+    print("🎉 All 50 submissions completed successfully!")
+
+except Exception as e:
+    print(f"⚠️ An unexpected error occurred: {e}")
+finally:
+    # The browser window stays open so you can inspect results.
+    # Uncomment the line below if you want it to close automatically.
+    # driver.quit()
+    pass
